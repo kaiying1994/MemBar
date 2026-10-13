@@ -9,3 +9,6 @@ MemBar.iconset/
 .DS_Store
 *.swp
 *~
+
+# 本机发布脚本（含失效凭证助手的清理逻辑，不进公开仓库）
+publish-github.sh

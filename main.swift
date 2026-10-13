@@ -138,15 +138,15 @@ enum Sampler {
             proc_name(pid, &nameBuf, UInt32(nameBuf.count))
             var nm = String(cString: nameBuf)
 
-            // Electron / Helper / Renderer 这类进程名看不出是谁，从可执行路径反推 .app 名字
+            // 从可执行路径反推所属 .app：取「最外层」以 .app 结尾的路径段。
+            // 不能用 range(of: ".app") 做子串匹配 —— "com.apple..." 本身就含 ".app"，
+            // 会把 Safari 网页进程（com.apple.WebKit.WebContent）截成 "com"。
             var pathBuf = [CChar](repeating: 0, count: 4096)
             if proc_pidpath(pid, &pathBuf, UInt32(pathBuf.count)) > 0 {
                 let path = String(cString: pathBuf)
-                if let r = path.range(of: ".app") {
-                    let head = String(path[path.startIndex..<r.lowerBound])
-                    if let comp = head.split(separator: "/").last.map(String.init), !comp.isEmpty {
-                        nm = comp
-                    }
+                if let comp = path.split(separator: "/").first(where: { $0.hasSuffix(".app") }) {
+                    let app = String(comp.dropLast(4))
+                    if !app.isEmpty { nm = app }
                 }
             }
 
