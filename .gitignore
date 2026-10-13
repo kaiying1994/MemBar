@@ -1,0 +1,11 @@
+# 编译产物
+MemBar
+*.o
+
+# 中间产物（可由 make-icon.swift 重新生成）
+MemBar.iconset/
+
+# 系统垃圾
+.DS_Store
+*.swp
+*~
