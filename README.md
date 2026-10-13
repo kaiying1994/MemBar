@@ -14,6 +14,30 @@ macOS 菜单栏内存监控 · 原生 Swift 手写 · 零第三方依赖 · 常�
 |---|---|
 | ![圆环](docs/menubar-ring.png) ![阶梯柱](docs/menubar-bars.png) ![色点](docs/menubar-text.png) ![芯片](docs/menubar-chip.png) | ![面板](docs/panel.png) |
 
+## 下载安装
+
+**不想编译的，直接下成品** → [**Releases 页面**](https://github.com/kaiying1994/MemBar/releases/latest)
+
+| 文件 | 说明 |
+|---|---|
+| `MemBar-1.0.0.dmg` | 推荐。打开后把 MemBar.app 拖进「应用程序」 |
+| `MemBar-1.0.0-macOS-universal.zip` | 解压得到 MemBar.app，拖进「应用程序」 |
+
+Universal 二进制，**Apple Silicon 与 Intel 通吃**；要求 **macOS 13.0+**。
+
+### 首次打开被 macOS 拦下？
+
+App 未做 Apple 公证（需付费开发者账号），系统会提示「无法验证开发者」或「已损坏」。这是**签名状态**问题，不是文件坏了。二选一：
+
+**方法一（图形界面）**：在「应用程序」里 **右键点 MemBar.app → 打开 → 再点「打开」**。只需一次。
+
+**方法二（终端，一条命令）**：
+```bash
+xattr -dr com.apple.quarantine /Applications/MemBar.app
+```
+
+打开后菜单栏右上角出现图标即成功。**没有 Dock 图标是正常的**——菜单栏 App 的设计如此。
+
 ## 特性
 
 - **拆解式面板**：分段堆叠条 + 图例，直接看到 8GB 被谁吃了，附 Swap、压缩比、压缩前原始数据、空闲+可回收
@@ -33,15 +57,21 @@ macOS 菜单栏内存监控 · 原生 Swift 手写 · 零第三方依赖 · 常�
 
 MemBar 用 `swiftc` 直接编译成单个二进制，无 Homebrew 依赖、无运行时。
 
-## 构建
+## 从源码构建
 
 ```bash
-git clone https://github.com/<你的用户名>/MemBar.git
+git clone https://github.com/kaiying1994/MemBar.git
 cd MemBar
 bash build.sh          # 编译 → ad-hoc 签名 → 组装 ~/Applications/MemBar.app
 ```
 
 要求：macOS 13.0+（Apple Silicon 或 Intel）、Xcode Command Line Tools（`xcode-select --install`）。
+
+打包可分发产物（universal zip + dmg，输出到 `dist/`）：
+
+```bash
+bash package-release.sh
+```
 
 重新生成图标（可选）：
 

@@ -1,6 +1,7 @@
 # 编译产物
 MemBar
 *.o
+dist/
 
 # 中间产物（可由 make-icon.swift 重新生成）
 MemBar.iconset/
