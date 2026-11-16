@@ -44,9 +44,21 @@ struct MemSample {
     var swapUsed: Double = 0
     var pressure: Int = 1
     var procs: [ProcRow] = []
+    /// 由 MemModel 注入：每个进程 footprint 的增速（字节/分钟）。
+    /// 只有跨两次采样才算得出来，所以首次打开面板时是空的。
+    var procGrowth: [String: Double] = [:]
+
+    /// 累计换出次数（内核计数器，单调递增，永不清零 —— 单看它没有意义）
+    var swapouts: UInt64 = 0
+    /// 由 MemModel 注入：最近一分钟换出次数，这才是当下的体感来源
+    var swapRate: Double = 0
+    /// 由 MemModel 注入：最近 30 次采样里每格是否发生换页（0/1）
+    var swapBeats: [Int] = []
 
     /// 与「内存压力」强相关的三项：内核 wired + 压缩内存 + 应用活跃
     var coreUsed: Double { wired + active + compressed }
+    /// 随时能腾出来的量：空闲 + 非活跃 + 预读 + 可清除
+    var reclaimable: Double { free + inactive + speculative + purgeable }
     var ratio: Double { total > 0 ? min(1, max(0, coreUsed / total)) : 0 }
     var ratioPct: Int { Int((ratio * 100).rounded()) }
     var compRatio: Double { compressed > 0 ? uncompressedInComp / compressed : 0 }
@@ -57,6 +69,15 @@ struct MemSample {
         default: return "紧急"
         }
     }
+
+    /// 一句话结论：比百分比更能回答「我现在有事没事」
+    var verdict: (text: String, level: Int) {
+        if pressure >= 4 { return ("内存紧急", 2) }
+        if pressure >= 2 { return ("内存紧张", 2) }
+        if swapRate >= 120 { return ("换页频繁", 1) }
+        if swapRate >= 12 { return ("轻微换页", 1) }
+        return ("内存稳定", 0)
+    }
 }
 
 // MARK: - 采样器
@@ -64,7 +85,8 @@ struct MemSample {
 enum Sampler {
 
     static func readVM() -> (free: Double, active: Double, inactive: Double, spec: Double,
-                             wired: Double, comp: Double, purgeable: Double, uncompInComp: Double)? {
+                             wired: Double, comp: Double, purgeable: Double, uncompInComp: Double,
+                             swapouts: UInt64)? {
         var stats = vm_statistics64_data_t()
         var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64_data_t>.size / MemoryLayout<integer_t>.size)
         let kr = withUnsafeMutablePointer(to: &stats) { ptr -> kern_return_t in
@@ -86,7 +108,8 @@ enum Sampler {
             Double(stats.wire_count) * ps,
             Double(stats.compressor_page_count) * ps,
             Double(stats.purgeable_count) * ps,
-            Double(stats.total_uncompressed_pages_in_compressor) * ps
+            Double(stats.total_uncompressed_pages_in_compressor) * ps,
+            stats.swapouts
         )
     }
 
@@ -185,6 +208,7 @@ enum Sampler {
             s.compressed = vm.comp
             s.purgeable = vm.purgeable
             s.uncompressedInComp = vm.uncompInComp
+            s.swapouts = vm.swapouts
         }
         let sw = readSwap()
         s.swapTotal = sw.total
@@ -194,7 +218,9 @@ enum Sampler {
     }
 
     /// 完整：附带进程榜（面板打开时用）
-    static func full(limit: Int = 5) -> MemSample {
+    /// 取 10 个而不是 5 个 —— 榜上只显示 5 行，但要多采几个才能算出「谁在涨」，
+    /// 否则一个排第 6、正在猛涨的进程永远进不了视野。
+    static func full(limit: Int = 10) -> MemSample {
         var s = light()
         s.procs = readProcs(limit: limit)
         return s
@@ -228,10 +254,20 @@ enum BarStyle: String, CaseIterable, Identifiable {
 @MainActor
 final class MemModel: ObservableObject {
     @Published var sample = Sampler.light()
+    /// 菜单栏专用：非 @Published，刷新时不触发 SwiftUI 通知
+    /// （面板关闭时若还走 @Published，@Published 会每 2 秒让整棵视图树重算一遍）
+    var barSample = Sampler.light()
     @Published var history: [Double] = []
     @Published var style: BarStyle = .bars {
-        didSet { UserDefaults.standard.set(style.rawValue, forKey: BarStyle.defaultsKey) }
+        didSet {
+            // 调试参数 --style= 只影响本次进程，不该把用户的偏好覆盖掉
+            guard persistStyle else { return }
+            UserDefaults.standard.set(style.rawValue, forKey: BarStyle.defaultsKey)
+        }
     }
+    var persistStyle = true
+    /// 进程榜排序方式：0 = 占用，1 = 增长（放在这里而不是 @State，命令行 swiftc 构建下宏不可用）
+    @Published var procMode = 0
 
     /// 读回上次选择的样式（在 App 启动时于主线程调用）
     func loadStylePreference() {
@@ -264,21 +300,104 @@ final class MemModel: ObservableObject {
     }
 
     func refresh(deep: Bool) {
-        let s = deep ? Sampler.full() : Sampler.light()
+        var s = deep ? Sampler.full() : Sampler.light()
+        trackSwap(&s)
+        if deep { trackProcGrowth(&s) }
+        barSample = s                  // 菜单栏永远拿最新值，且不产生 SwiftUI 通知
+        guard deep else { return }     // 面板关闭时到此为止：不碰 @Published
         sample = s
         history.append(s.ratio)
         if history.count > 60 { history.removeFirst(history.count - 60) }
+    }
+
+    // MARK: 换页活动追踪
+
+    /// 内核换出计数器只增不减，必须差分才能看出「此刻在不在换页」。
+    /// 面板关着也照跑，这样一打开就有完整的心跳历史。
+    private var lastSwapouts: UInt64 = 0
+    private var lastSwapAt = Date()
+    private var swapBeats = [Int](repeating: 0, count: 30)
+    private var swapRate: Double = 0
+
+    private func trackSwap(_ s: inout MemSample) {
+        let now = Date()
+        let dt = now.timeIntervalSince(lastSwapAt)
+
+        if lastSwapouts > 0, dt > 0.5, s.swapouts >= lastSwapouts {
+            let delta = Double(s.swapouts - lastSwapouts)
+            let instant = delta / dt * 60
+            // 指数平滑，避免单次 0 换出就把速率打成 0 造成闪烁
+            swapRate = swapRate * 0.6 + instant * 0.4
+            if instant == 0 && swapRate < 1 { swapRate = 0 }
+            swapBeats.append(delta > 0 ? 1 : 0)
+            if swapBeats.count > 30 { swapBeats.removeFirst(swapBeats.count - 30) }
+        }
+
+        lastSwapouts = s.swapouts
+        lastSwapAt = now
+        s.swapRate = swapRate
+        s.swapBeats = swapBeats
+    }
+
+    // MARK: 进程增速追踪（P2）
+
+    /// 「谁在涨」比「谁最大」有用：拖垮 8G 机器的从来是持续增长的那个。
+    /// 只在面板打开时采样（deep），所以关着面板不产生任何额外开销。
+    /// 速率按「最近 60 秒内最早一次采样」为基准算，而不是只跟上一次比 ——
+    /// 单次 5 秒的差值太吵，进程一启动就是几百 MB/分，全是假警报。
+    private var procHist: [String: [(t: Date, b: Double)]] = [:]
+    private var procGrowth: [String: Double] = [:]
+
+    private func trackProcGrowth(_ s: inout MemSample) {
+        guard !s.procs.isEmpty else { return }
+        let now = Date()
+        var next: [String: Double] = [:]
+
+        for p in s.procs {
+            var h = procHist[p.name] ?? []
+            h.append((now, p.bytes))
+            h.removeAll { now.timeIntervalSince($0.t) > 60 }
+            procHist[p.name] = h
+            guard let first = h.first else { continue }
+            let dt = now.timeIntervalSince(first.t)
+            guard dt >= 4 else { continue }        // 窗口太短，差值不可信
+            next[p.name] = (p.bytes - first.b) / dt * 60
+        }
+
+        // 掉了的进程不再留着，避免字典无限增长
+        let alive = Set(s.procs.map { $0.name })
+        procHist = procHist.filter { alive.contains($0.key) }
+
+        procGrowth = next
+        s.procGrowth = next
     }
 }
 
 // MARK: - 配色
 
 enum Palette {
-    static let wired = Color(red: 0.64, green: 0.18, blue: 0.18)      // #A32D2D
-    static let compressor = Color(red: 0.886, green: 0.294, blue: 0.290) // #E24B4A
-    static let active = Color(red: 0.216, green: 0.541, blue: 0.867)   // #378ADD
-    static let reclaim = Color(red: 0.522, green: 0.718, blue: 0.922)  // #85B7EB
+    // 段条按「能不能腾出来」排序配色，不是按危险程度：
+    // 左边实心是动不了的墙，右边越淡越容易丢。
+    static let wired = Color(red: 0.373, green: 0.369, blue: 0.353)      // #5F5E5A 中性
+    static let compressor = Color(red: 0.114, green: 0.620, blue: 0.459)  // #1D9E75 系统的努力
+    static let active = Color(red: 0.216, green: 0.541, blue: 0.867)      // #378ADD 在用
+    static let reclaim = Color(red: 0.706, green: 0.698, blue: 0.663).opacity(0.42) // 可回收
     static let idle = Color.secondary.opacity(0.22)
+
+    static let beatHot = Color(red: 0.937, green: 0.624, blue: 0.153)     // #EF9F27
+    static let beatCool = Color(red: 0.592, green: 0.769, blue: 0.349)    // #97C459
+
+    static let good = Color(red: 0.369, green: 0.600, blue: 0.176)
+    static let warn = Color(red: 0.729, green: 0.459, blue: 0.090)
+    static let bad = Color(red: 0.816, green: 0.176, blue: 0.176)
+
+    static func verdictColor(_ level: Int) -> Color {
+        switch level {
+        case 1: return warn
+        case 2: return bad
+        default: return good
+        }
+    }
 }
 
 // MARK: - 面板
@@ -294,15 +413,16 @@ struct PanelView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
-            segBar.padding(.top, 12)
-            legend.padding(.top, 10)
-            Divider().opacity(0.5).padding(.vertical, 12)
-            facts
-            Divider().opacity(0.5).padding(.vertical, 12)
+            segBar.padding(.top, 11)
+            legend.padding(.top, 9)
+            Divider().opacity(0.5).padding(.vertical, 11)
+            beatRow
+            facts.padding(.top, 9)
+            Divider().opacity(0.5).padding(.vertical, 11)
             procSection
-            Divider().opacity(0.5).padding(.vertical, 12)
+            Divider().opacity(0.5).padding(.vertical, 11)
             styleSection
-            Divider().opacity(0.5).padding(.vertical, 12)
+            Divider().opacity(0.5).padding(.vertical, 11)
             footer
         }
         .padding(.horizontal, 16)
@@ -311,30 +431,29 @@ struct PanelView: View {
         .onChange(of: model.style) { _ in onStyleChange() }
     }
 
-    // ---- 顶部大数字 ----
+    // ---- 顶部：一句话结论，不是百分比 ----
     private var header: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text("内存").font(.system(size: 13, weight: .medium)).foregroundStyle(.secondary)
+        let v = s.verdict
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 7) {
+                Circle()
+                    .fill(Palette.verdictColor(v.level))
+                    .frame(width: 7, height: 7)
+                Text(v.text)
+                    .font(.system(size: 17, weight: .medium))
                 Spacer()
-                Text("内核压力 " + s.pressureText)
+                Text("压力 " + s.pressureText)
                     .font(.system(size: 11, weight: .medium))
-                    .padding(.horizontal, 8).padding(.vertical, 2)
+                    .padding(.horizontal, 7).padding(.vertical, 2)
                     .background(badgeBg, in: Capsule())
                     .foregroundStyle(badgeFg)
             }
-            HStack(alignment: .firstTextBaseline, spacing: 10) {
-                Text("\(s.ratioPct)%")
-                    .font(.system(size: 36, weight: .medium, design: .rounded))
-                    .monospacedDigit()
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("已用 " + fmtGB(s.coreUsed))
-                        .font(.system(size: 12)).monospacedDigit()
-                    Text("共 " + fmtGB(s.total).replacingOccurrences(of: " GB", with: " GB"))
-                        .font(.system(size: 12)).monospacedDigit().foregroundStyle(.secondary)
-                }
-                .padding(.bottom, 3)
-                Spacer()
+            HStack(spacing: 6) {
+                Text(fmtGB(s.coreUsed) + " / " + fmtGB(s.total))
+                    .font(.system(size: 12, design: .monospaced))
+                Text("余量 " + fmtGB(s.reclaimable))
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundStyle(.secondary)
             }
         }
     }
@@ -354,53 +473,88 @@ struct PanelView: View {
         }
     }
 
-    // ---- 分段占位条 ----
+    // ---- 分段占位条：按「能不能腾出来」从左到右排 ----
     private var segments: [(String, Double, Color)] {
         [
             ("内核 wired", s.wired, Palette.wired),
-            ("压缩内存", s.compressed, Palette.compressor),
             ("应用活跃", s.active, Palette.active),
-            ("可回收缓存", s.inactive, Palette.reclaim),
+            ("压缩内存", s.compressed, Palette.compressor),
+            ("可回收缓存", s.reclaimable, Palette.reclaim),
         ]
     }
 
     private var segBar: some View {
         GeometryReader { geo in
             let w = geo.size.width
-            let t = max(s.total, 1)
+            let sum = segments.reduce(0) { $0 + $1.1 }
+            let t = max(s.total, sum, 1)
             HStack(spacing: 1.5) {
                 ForEach(Array(segments.enumerated()), id: \.offset) { _, seg in
                     RoundedRectangle(cornerRadius: 2, style: .continuous)
                         .fill(seg.2)
                         .frame(width: max(0, w * (seg.1 / t) - 1.5))
                 }
-                RoundedRectangle(cornerRadius: 2, style: .continuous)
-                    .fill(Palette.idle)
-                    .frame(minWidth: 0)
             }
         }
         .frame(height: 11)
     }
 
     private var legend: some View {
-        VStack(spacing: 5) {
+        let sum = segments.reduce(0) { $0 + $1.1 }
+        let t = max(s.total, sum, 1)
+        return VStack(spacing: 5) {
             ForEach(Array(segments.enumerated()), id: \.offset) { _, seg in
-                HStack(spacing: 8) {
+                HStack(spacing: 6) {
                     Circle().fill(seg.2).frame(width: 8, height: 8)
                     Text(seg.0).font(.system(size: 12))
-                    Spacer()
+                    if seg.0 == "压缩内存", s.compRatio > 0.05 {
+                        Text(String(format: "%.1f×", s.compRatio))
+                            .font(.system(size: 10.5, weight: .medium))
+                            .padding(.horizontal, 4).padding(.vertical, 1)
+                            .background(Palette.compressor.opacity(0.16),
+                                        in: RoundedRectangle(cornerRadius: 3))
+                            .foregroundStyle(Palette.compressor)
+                    }
+                    Spacer(minLength: 4)
                     Text(fmtGB(seg.1)).font(.system(size: 12)).monospacedDigit().foregroundStyle(.secondary)
-                    Text("\(Int((seg.1 / max(s.total, 1) * 100).rounded()))%")
+                    Text("\(Int((seg.1 / t * 100).rounded()))%")
                         .font(.system(size: 11)).monospacedDigit()
                         .foregroundStyle(.tertiary)
-                        .frame(width: 30, alignment: .trailing)
+                        .frame(width: 28, alignment: .trailing)
                 }
             }
-            Text("菜单栏胶囊配色：< 75% 绿 · 75–88% 黄 · ≥ 88% 红")
+            Text("左侧实心不可回收 · 右侧浅色随时能腾")
                 .font(.system(size: 11))
                 .foregroundStyle(.tertiary)
-                .padding(.top, 8)
+                .padding(.top, 7)
                 .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    // ---- 换页心跳：看的是「此刻在不在动」，不是累计值 ----
+    private var beatRow: some View {
+        let rate = s.swapRate
+        let hot = rate >= 1
+        return HStack(spacing: 8) {
+            Text("换页").font(.system(size: 12)).foregroundStyle(.secondary)
+            HStack(alignment: .bottom, spacing: 1.5) {
+                ForEach(Array(s.swapBeats.enumerated()), id: \.offset) { _, v in
+                    Capsule()
+                        .fill(v > 0 ? Palette.beatHot : Palette.beatCool.opacity(0.55))
+                        .frame(maxWidth: .infinity)
+                        .frame(height: v > 0 ? 10 : 6)
+                }
+            }
+            .frame(height: 10, alignment: .bottom)
+            .background(alignment: .bottom) {
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(Color.secondary.opacity(0.10))
+                    .frame(height: 10)
+            }
+            Text(rate < 1 ? "0 次/分" : String(format: "%.0f 次/分", rate))
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(hot ? Palette.beatHot : Color.secondary)
+                .frame(width: 56, alignment: .trailing)
         }
     }
 
@@ -410,9 +564,7 @@ struct PanelView: View {
             factRow("物理内存", fmtGB(s.total))
             factRow("Swap 已用", s.swapUsed > 0 ? fmtMB(s.swapUsed) + " / " + fmtMB(s.swapTotal)
                                               : "无（0 MB）")
-            factRow("压缩比", s.compRatio > 0 ? String(format: "%.2f : 1", s.compRatio) : "—")
             factRow("压缩前原始数据", fmtGB(s.uncompressedInComp))
-            factRow("空闲 + 可回收", fmtGB(s.free + s.inactive + s.speculative + s.purgeable))
         }
     }
 
@@ -425,26 +577,74 @@ struct PanelView: View {
     }
 
     // ---- 进程榜 ----
+    /// 0 = 按占用，1 = 按增长速度（放在 model 里：本工程用命令行 swiftc 构建，@State 宏不可用）
+    private var procMode: Int { model.procMode }
+
+    private var procRows: [ProcRow] {
+        let base = s.procs
+        if procMode == 0 {
+            return Array(base.sorted { $0.bytes > $1.bytes }.prefix(5))
+        }
+        return Array(base.sorted {
+            (s.procGrowth[$0.name] ?? -Double.greatestFiniteMagnitude)
+                > (s.procGrowth[$1.name] ?? -Double.greatestFiniteMagnitude)
+        }.prefix(5))
+    }
+
     private var procSection: some View {
         VStack(alignment: .leading, spacing: 7) {
-            Text("占用最高的进程").font(.system(size: 11)).foregroundStyle(.secondary)
+            HStack(spacing: 6) {
+                Text(procMode == 0 ? "占用最高的进程" : "涨得最快的进程")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                Spacer()
+                Picker("", selection: Binding(
+                    get: { model.procMode },
+                    set: { model.procMode = $0 }
+                )) {
+                    Text("占用").tag(0)
+                    Text("增长").tag(1)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .controlSize(.mini)
+                .frame(width: 92)
+            }
+
             if s.procs.isEmpty {
                 Text("展开面板时读取…").font(.system(size: 12)).foregroundStyle(.tertiary)
+            } else if procMode == 1 && s.procGrowth.isEmpty {
+                Text("测量中：需要两次采样，约 5 秒后出现…")
+                    .font(.system(size: 12)).foregroundStyle(.tertiary)
             } else {
-                let maxB = s.procs.first?.bytes ?? 1
-                ForEach(s.procs) { p in
+                let rows = procRows
+                let maxB = max(rows.first?.bytes ?? 1, 1)
+                // 分母至少 10 MB/分：否则几十 KB 的抖动会被放大成满格，与「持平」字样自相矛盾
+                let maxG = max(rows.compactMap { s.procGrowth[$0.name] }.filter { $0 > 0 }.max() ?? 0, 10 * MB)
+                ForEach(rows) { p in
+                    let g = s.procGrowth[p.name] ?? 0
+                    let isGrow = procMode == 1
+                    // 增长模式下 < 1 MB/分 视为持平，条长为 0，和文字保持一致
+                    let frac = isGrow ? (g > MB ? g / maxG : 0) : p.bytes / maxB
                     VStack(alignment: .leading, spacing: 3) {
-                        HStack {
+                        HStack(spacing: 6) {
                             Text(p.name).font(.system(size: 12)).lineLimit(1).truncationMode(.middle)
                             Spacer()
+                            if isGrow {
+                                Text(growthText(g))
+                                    .font(.system(size: 12)).monospacedDigit()
+                                    .foregroundStyle(g > 2 * MB ? Palette.warn
+                                                     : (g > 0 ? Color.secondary : Color.secondary.opacity(0.6)))
+                            }
                             Text(humanBytes(p.bytes)).font(.system(size: 12)).monospacedDigit()
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(isGrow ? .tertiary : .secondary)
                         }
-                        GeometryReader { g in
+                        GeometryReader { geo in
                             ZStack(alignment: .leading) {
                                 RoundedRectangle(cornerRadius: 1.5).fill(Palette.idle)
-                                RoundedRectangle(cornerRadius: 1.5).fill(Palette.active.opacity(0.85))
-                                    .frame(width: max(2, g.size.width * (p.bytes / max(maxB, 1))))
+                                RoundedRectangle(cornerRadius: 1.5)
+                                    .fill(isGrow ? Palette.beatHot.opacity(0.85) : Palette.active.opacity(0.85))
+                                    .frame(width: isGrow ? geo.size.width * min(1, max(0, frac))
+                                                         : max(2, geo.size.width * min(1, max(0, frac))))
                             }
                         }
                         .frame(height: 3)
@@ -452,6 +652,13 @@ struct PanelView: View {
                 }
             }
         }
+    }
+
+    private func growthText(_ bytesPerMin: Double) -> String {
+        if bytesPerMin >= 0.95 * GB { return String(format: "+%.1f GB/分", bytesPerMin / GB) }
+        if bytesPerMin >= 1 * MB { return String(format: "+%.0f MB/分", bytesPerMin / MB) }
+        if bytesPerMin <= -1 * MB { return String(format: "%.0f MB/分", bytesPerMin / MB) }
+        return "持平"
     }
 
     private var styleSection: some View {
@@ -464,7 +671,7 @@ struct PanelView: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            Text("点一下即时生效，已记住选择")
+            Text("形状 = 占用比例　颜色 = 压力　数字 = 可释放余量")
                 .font(.system(size: 11)).foregroundStyle(.tertiary)
 
             Divider().opacity(0.5).padding(.vertical, 6)
@@ -491,7 +698,7 @@ struct PanelView: View {
 
     private var footer: some View {
         HStack(spacing: 8) {
-            Text("每 2 秒刷新").font(.system(size: 11)).foregroundStyle(.tertiary)
+            Text("每 5 秒刷新").font(.system(size: 11)).foregroundStyle(.tertiary)
             Spacer()
             Button("刷新") { onRefresh() }
                 .buttonStyle(.borderless)
@@ -516,6 +723,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let model = MemModel()
     private var timer: Timer?
     private var popoverOpen = false
+    /// 调试用：把面板塞进独立窗口，避免 NSPopover 的 transient 行为导致截图时自动关闭
+    private var debugWindow: NSWindow?
+    // 菜单栏图标缓存：数值没变就复用同一个 NSImage，避免每 2 秒重建位图并上传 WindowServer
+    private var drawKey = ""
+    private var lastTip = ""
+    private var lastText = ""
 
     /// 让弹窗高度贴合 SwiftUI 内容的真实高度（否则会被裁掉）
     private static func fitSize(_ h: NSHostingController<PanelView>) -> NSSize {
@@ -582,7 +795,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let root = PanelView(
             model: model,
             onQuit: { NSApp.terminate(nil) },
-            onRefresh: { [weak self] in self?.model.refresh(deep: true) },
+            onRefresh: { [weak self] in
+                self?.model.refresh(deep: true)
+                self?.redrawStatusItem()
+            },
             onStyleChange: { [weak self] in self?.redrawStatusItem() }
         )
         let host = NSHostingController(rootView: root)
@@ -598,9 +814,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.loadStylePreference()
         model.refreshAutoStart()
 
-        // 调试用：MemBar --style=bars|ring|text|chip 强制指定样式（用于截图对比）
+        // 调试用：MemBar --proc=growth 直接以「增长」排序打开面板（截图核对用）
+        model.procMode = CommandLine.arguments.contains("--proc=growth") ? 1 : 0
+
+        // 调试用：MemBar --style=bars|ring|text|chip 强制指定样式（用于截图对比，不写入偏好）
         if let a = CommandLine.arguments.first(where: { $0.hasPrefix("--style=") }) {
             if let st = BarStyle(rawValue: String(a.dropFirst("--style=".count))) {
+                model.persistStyle = false
                 model.style = st
             }
         }
@@ -608,7 +828,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.refresh(deep: false)
         redrawStatusItem()
 
-        timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
                 self.model.refresh(deep: self.popoverOpen)
@@ -622,6 +842,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
                 self?.togglePopover()
             }
+        }
+
+        // 调试用：MemBar --panel-window 把面板放进独立浮动窗口，便于截图核对布局
+        if CommandLine.arguments.contains("--panel-window") {
+            popoverOpen = true   // 让定时器继续走 deep 采样，否则进程增速永远是空的
+            model.refresh(deep: true)
+            let pv = PanelView(model: model, onQuit: {}, onRefresh: {}, onStyleChange: {})
+            let c = NSHostingController(rootView: pv)
+            c.sizingOptions = [.preferredContentSize]
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 340, height: 760),
+                             styleMask: [.titled, .closable],
+                             backing: .buffered, defer: false)
+            w.contentViewController = c
+            w.title = "MemBar Panel"
+            w.setContentSize(c.view.fittingSize)
+            w.center()
+            w.level = .floating
+            w.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            debugWindow = w
         }
     }
 
@@ -647,17 +887,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 由系统决定的（浅色模式 + 深色壁纸 = 白字），必须读状态栏按钮自己的 appearance
         let isDark = btn.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
 
-        let ratio = CGFloat(model.sample.ratio)
-        let pct = "\(model.sample.ratioPct)%"
-        let tint = Self.tintColor(ratio: model.sample.ratio, pressure: model.sample.pressure)
+        let s = model.barSample
+        let ratio = CGFloat(s.ratio)
+        // 菜单栏显示「还能腾出多少」，而不是「占了多少」：
+        // 前者自己就是答案，后者还要用户知道多少算多。副屏/余光场景下差别很大。
+        let text = Self.remainText(s.reclaimable)
+        let tint = Self.tintColor(pressure: s.pressure, swapRate: s.swapRate)
         let textColor: NSColor = isDark ? .white : .black
         let style = model.style
 
-        let font = NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .medium)
-        let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: textColor]
-        let textW = ceil((pct as NSString).size(withAttributes: attrs).width)
+        // toolTip 不涉及位图，但同样去重，否则每次采样都会推一次状态栏更新
+        let tip = s.verdict.text
+            + String(format: "　余量 %.2fG / 共 %.2fG\n换页 %.0f 次/分　wired %.2fG　压缩 %.2fG（%.1f×）",
+                     s.reclaimable / GB, s.total / GB, s.swapRate,
+                     s.wired / GB, s.compressed / GB, s.compRatio)
+            + "\n样式：\(style.label)（可在面板里切换）"
+        if tip != lastTip { btn.toolTip = tip; lastTip = tip }
 
-        let gap: CGFloat = 5
+        // 位图只在「图形真需要变」时重建：柱格数 / 圆环弧长 / 颜色档位 / 样式 / 明暗。
+        // 文字不画进位图，改走 attributedTitle —— 它每次采样都会变，
+        // 画进位图等于每次重建一张位图并上传 WindowServer，那才是 CPU 的大头。
+        // 颜色档位跟内核压力/换页走，不再跟「已用百分比」走：
+        // Mac 的已用比例常年 70~85% 却毫无问题，用它上色只会一直黄。
+        let tier = Self.tintTier(pressure: s.pressure, swapRate: s.swapRate)
+        let shape: String
+        switch style {
+        case .bars: shape = "\(max(0, min(5, Int(ceil(Double(ratio) * 5.0 - 0.001)))))"
+        case .ring: shape = "\(Int((Double(ratio) * 10).rounded()))"
+        default:    shape = "\(tier)"
+        }
+        let key = "\(shape)|\(tier)|\(style.rawValue)|\(isDark)"
+
         let h: CGFloat = 18
         let graphicW: CGFloat
         switch style {
@@ -666,9 +926,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .chip: graphicW = 15
         case .text: graphicW = 7
         }
-        let totalW = graphicW + gap + textW
 
-        let img = NSImage(size: NSSize(width: totalW, height: h), flipped: false) { _ in
+        if key != drawKey {
+        drawKey = key
+        let img = NSImage(size: NSSize(width: graphicW, height: h), flipped: false) { _ in
             switch style {
             case .bars:
                 // 阶梯柱：像信号格，绝不会被误认成电池
@@ -733,33 +994,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 dot.fill()
             }
 
-            // 百分比数字
-            let ty = (h - font.ascender + font.descender) / 2 + 0.4
-            (pct as NSString).draw(at: NSPoint(x: graphicW + gap, y: ty), withAttributes: attrs)
             return true
         }
         img.isTemplate = false
-
         btn.image = img
-        btn.title = ""
-        btn.imagePosition = .imageOnly
-        btn.toolTip = String(
-            format: "内存 %d%%（<75%% 绿 · 75–88%% 黄 · ≥88%% 红）\n内核压力 %@　wired %.2fG　压缩 %.2fG　Swap %.0fM\n样式：%@（可在面板里切换）",
-            model.sample.ratioPct,
-            model.sample.pressureText,
-            model.sample.wired / GB,
-            model.sample.compressed / GB,
-            model.sample.swapUsed / MB,
-            style.label)
+        btn.imagePosition = .imageLeading
+        }
+
+        // 文字单独更新：只改文本属性，不重建位图
+        if text != lastText {
+            lastText = text
+            btn.attributedTitle = NSAttributedString(
+                string: text,
+                attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .medium),
+                             .foregroundColor: textColor])
+        }
     }
 
-    private static func tintColor(ratio: Double, pressure: Int) -> NSColor {
-        // 颜色必须和菜单栏上那个百分比同源、同刻度，否则用户会看到「60% 却是黄的」这种矛盾。
-        // 分档阈值：<75% 绿 · 75–88% 黄 · ≥88% 红（已把 wired 约 22% 的固定底噪算进去）
-        if pressure >= 4 { return NSColor.systemRed }   // 内核判定 CRITICAL 时直接红
-        if ratio >= 0.88 { return NSColor.systemRed }
-        if ratio >= 0.75 { return NSColor.systemOrange }
-        return NSColor.systemGreen
+    /// 余量文案：>= 1G 用 1.4G，否则用 820M。字体等宽，宽度变化不会顶动别的图标。
+    private static func remainText(_ bytes: Double) -> String {
+        if bytes >= GB { return String(format: "%.1fG", bytes / GB) }
+        if bytes >= 100 * MB { return String(format: "%.0fM", bytes / MB) }
+        return String(format: "%.0fM", max(0, bytes / MB))
+    }
+
+    /// 颜色只看「有没有出事」，不看占用比例 —— Mac 的 80% 通常是健康的
+    private static func tintTier(pressure: Int, swapRate: Double) -> Int {
+        if pressure >= 2 { return 2 }        // 内核判 WARN / CRITICAL
+        if swapRate >= 120 { return 2 }      // 每分钟百次以上换页，已经在硬扛
+        if swapRate >= 12 { return 1 }
+        return 0
+    }
+
+    private static func tintColor(pressure: Int, swapRate: Double) -> NSColor {
+        switch tintTier(pressure: pressure, swapRate: swapRate) {
+        case 2: return NSColor.systemRed
+        case 1: return NSColor.systemOrange
+        default: return NSColor.systemGreen
+        }
     }
 }
 
