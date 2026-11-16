@@ -22,8 +22,8 @@ macOS 菜单栏内存监控 · 原生 Swift 手写 · 零第三方依赖 · 常�
 
 | 文件 | 说明 |
 |---|---|
-| `MemBar-1.0.0.dmg` | 推荐。打开后把 MemBar.app 拖进「应用程序」 |
-| `MemBar-1.0.0-macOS-universal.zip` | 解压得到 MemBar.app，拖进「应用程序」 |
+| `MemBar-1.1.0.dmg` | 推荐。打开后把 MemBar.app 拖进「应用程序」 |
+| `MemBar-1.1.0-macOS-universal.zip` | 解压得到 MemBar.app，拖进「应用程序」 |
 
 Universal 二进制，**Apple Silicon 与 Intel 通吃**；要求 **macOS 13.0+**。
 
